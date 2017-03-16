@@ -312,26 +312,33 @@ Signals an error if the response does not contain an HTTP 200 status code."
                 'mouse-face 'mode-line-highlight
                 'face face)))
 
+(defun build-status--turn-on-when-global (root)
+  (when (and root
+             global-build-status-mode
+             (not (build-status--activate-mode)))
+    (build-status-mode 1)))
+
 (defvar build-status-mode-line-string
   '(:eval
-    (let* ((root (or (build-status--circle-ci-project-root (buffer-file-name))
-                     (build-status--travis-ci-project-root (buffer-file-name))))
-           (status (cdr (assoc root build-status--project-status-alist))))
-      (if (null status)
-          ""
-        (concat " "
-                (cond
-                 ((string= status "passed")
-                  (build-status--propertize "P" status))
-                 ((string= status "running")
-                  (build-status--propertize "R" status))
-                 ((string= status "failed")
-                  (build-status--propertize "F" status))
-                 ((string= status "queued")
-                  (build-status--propertize "Q" status))
-                 (t
-                  (build-status--propertize "?" (replace-regexp-in-string "[^a-zA-Z0-9[:space:]]+" " "
-                                                                          (or status "unknown")))))))))
+    (let ((root (or (build-status--circle-ci-project-root (buffer-file-name))
+                    (build-status--travis-ci-project-root (buffer-file-name)))))
+      (build-status--turn-on-when-global root)
+      (let ((status (cdr (assoc root build-status--project-status-alist))))
+        (if (null status)
+            ""
+          (concat " "
+                  (cond
+                   ((string= status "passed")
+                    (build-status--propertize "P" status))
+                   ((string= status "running")
+                    (build-status--propertize "R" status))
+                   ((string= status "failed")
+                    (build-status--propertize "F" status))
+                   ((string= status "queued")
+                    (build-status--propertize "Q" status))
+                   (t
+                    (build-status--propertize "?" (replace-regexp-in-string "[^a-zA-Z0-9[:space:]]+" " "
+                                                                            (or status "unknown"))))))))))
   "Build status mode line string.")
 ;;;###autoload (put 'build-status-mode-line-string 'risky-local-variable t)
 
@@ -371,6 +378,19 @@ Signals an error if the response does not contain an HTTP 200 status code."
       (browse-url (if (eq 'circle-ci (car project))
                     (build-status--circle-ci-url project)
                     (build-status--travis-ci-url project))))))
+
+;;;###autoload
+(define-minor-mode global-build-status-mode
+  "Turn on `build-status-mode' everywhere possible."
+  :init-value nil
+  :global     t
+  (if global-build-status-mode
+      (add-to-list 'global-mode-string 'build-status-mode-line-string t)
+    (delq 'build-status-mode-line-string global-mode-string)
+    (cl-dolist (buf (buffer-list))
+      (with-current-buffer buf
+        (when (build-status--activate-mode)
+          (build-status--toggle-mode nil))))))
 
 ;;;###autoload
 (define-minor-mode build-status-mode
