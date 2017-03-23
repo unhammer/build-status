@@ -198,41 +198,58 @@ If `FILENAME' is not part of a CI project return nil."
             (nth 5 project)
             (nth 6 project))))
 
-(defun build-status--travis-ci-url (project)
-  (let* ((json (build-status--travis-ci-branch-request project))
-         (build (cdr (assq 'id (assq 'branch json)))))
-    (format "https://travis-ci.org/%s/%s/builds/%s"
-            (nth 4 project)
-            (nth 5 project)
-            build)))
+(defun build-status--travis-ci-url (project success error)
+  (build-status--travis-ci-branch-request
+   project
+   (lambda (json)
+     (let ((build (cdr (assq 'id (assq 'branch json)))))
+       (funcall success
+                (format "https://travis-ci.org/%s/%s/builds/%s"
+                        (nth 4 project)
+                        (nth 5 project)
+                        build))))
+   error))
 
-(defun build-status--http-request (url)
-  "Make an HTTP request to `URL', parse the JSON response and return it.
-Signals an error if the response does not contain an HTTP 200 status code."
-  (with-current-buffer (url-retrieve-synchronously url)
-    ;; (message "%s\n%s" url (buffer-substring-no-properties 1 (point-max)))
-    (goto-char (point-min))
-    (when (and (search-forward-regexp "HTTP/1\\.[01] \\([0-9]\\{3\\}\\)")
-               (not (string= (match-string 1) "200")))
-      (error "Request to %s failed with HTTP status %s" url (match-string 1)))
+(defun build-status--http-request (url success error)
+  "Make an HTTP request to `URL', parse the JSON response.
+Call `SUCCESS' with the parsed response on success; call `ERROR'
+with an error message and the status plist of `url-retrieve' if
+the response does not contain an HTTP 200 status code."
+  (condition-case e
+      (url-retrieve
+       url
+       (lambda (status)
+         ;; (message "%s\n%s" url (buffer-substring-no-properties 1 (point-max)))
+         (goto-char (point-min))
+         (if (and (search-forward-regexp "HTTP/1\\.[01] \\([0-9]\\{3\\}\\)")
+                  (not (string= (match-string 1) "200")))
+             (funcall error
+                      (format "got HTTP status %s on retrieving %s" (match-string 1) url)
+                      status)
+           (search-forward-regexp "\n\n")
+           (funcall success
+                    (json-read)))))
+    (error (funcall error
+                    (format "got %s on retrieving %s" e url)
+                    nil))))
 
-    (search-forward-regexp "\n\n")
-    (json-read)))
-
-(defun build-status--circle-ci-status (project)
-  "Get the Circle CI build status of `PROJECT'."
+(defun build-status--circle-ci-branch-request (project success error)
+  "Get the Circle CI build status of `PROJECT'.
+`SUCCESS' and `ERROR' passed on to `build-status--http-request'."
   (let* ((url (apply 'format "https://circleci.com/api/v1.1/project/%s/%s/%s/tree/%s?limit=1"
                      `(,@(cdddr project))))
          (url-request-method "GET")
          (url-request-extra-headers '(("Accept" . "application/json")))
-         (token (nth 1 project))
-         json
-         status)
+         (token (nth 1 project)))
 
     (when token
       (setq url (format "%s&circle-token=%s" url token)))
+    (build-status--http-request url success error)))
 
-    (setq json (build-status--http-request url))
+(defun build-status--circle-ci-handle (json)
+  "Handle the Circle CI JSON respons."
+  (let (status)
+
     ;; When branch is not found a 200 is returned but the array is empty
     (when (> (length json) 0)
       (setq status (or (cdr (assq 'outcome (elt json 0)))
@@ -241,59 +258,65 @@ Signals an error if the response does not contain an HTTP 200 status code."
       (or (cdr (assoc status build-status-circle-ci-status-mapping-alist))
           status))))
 
-(defun build-status--travis-ci-request (url &optional token)
-  "Generic Travis CI request to `URL' using `TOKEN', if given."
+(defun build-status--travis-ci-request (url success error &optional token)
+  "Generic Travis CI request to `URL'.
+`SUCCESS' and `ERROR' passed on to `build-status--http-request'.
+Uses `TOKEN' for authorization, if given."
   (let ((url-request-method "GET")
         (url-request-extra-headers '(("Accept" . "application/vnd.travis-ci.2+json"))))
 
     (when token
       (push (cons "Authorization" (format "token %s" token)) url-request-extra-headers))
 
-    (build-status--http-request url)))
+    (build-status--http-request url success error)))
 
-(defun build-status--travis-ci-branch-request (project)
-  "Get the Travis CI build status of `PROJECT'."
+(defun build-status--travis-ci-branch-request (project success error)
+  "Get the Travis CI build status of `PROJECT'.
+`SUCCESS' and `ERROR' passed on to `build-status--http-request'."
   (let ((url (format "https://api.travis-ci.org/repos/%s/%s/branches/%s"
                      (nth 4 project)
                      (nth 5 project)
                      (nth 6 project)))
         (token (nth 1 project)))
 
-    (build-status--travis-ci-request url token)))
+    (build-status--travis-ci-request url success error token)))
 
-(defun build-status--travis-ci-status (project)
-  (let* ((json (build-status--travis-ci-branch-request project))
-         (status (cdr (assq 'state (assq 'branch json)))))
-
+(defun build-status--travis-ci-handle (json)
+  "Handle the Travis CI JSON respons."
+  (let ((status (cdr (assq 'state (assq 'branch json)))))
     (or (cdr (assoc status build-status-travis-ci-status-mapping-alist))
         status)))
 
 (defun build-status--update-status ()
+  "Update build status of all projects in `build-status--project-status-alist'."
   (let ((buffers (delq nil (mapcar 'buffer-file-name (buffer-list))))
         config
-        project
-        new-status)
+        project)
 
     (dolist (root (mapcar 'car build-status--project-status-alist))
       (setq config (assoc root build-status--project-status-alist))
       (setq project (build-status--project root))
       (if (and project (build-status--any-open-buffers root buffers))
-          (condition-case e
-              (progn
-                (setq new-status (if (eq (car project) 'circle-ci)
-                                     (build-status--circle-ci-status project)
-                                   (build-status--travis-ci-status project)))
-                ;; Don't show queued state unless we have no prior state
-                ;; Option to control this behavior?
-                (when (and (not (eq new-status 'ignore))
-                           (or (not (string= new-status "queued"))
-                               (null (cdr config))))
-                  (setcdr config new-status)))
-            (error (message "Failed to update status for %s: %s" root (cadr e))))
+          (let* ((handle-json (if (eq (car project) 'circle-ci)
+                                  #'build-status--circle-ci-handle
+                                #'build-status--travis-ci-handle))
+                 (make-request (if (eq (car project) 'circle-ci)
+                                   #'build-status--circle-ci-branch-request
+                                 #'build-status--travis-ci-branch-request))
+                 (handle-response (lambda (json)
+                                    (let ((status (funcall handle-json json)))
+                                      ;; Don't show queued state unless we have no prior state
+                                      ;; Option to control this behavior?
+                                      (when (and (not (eq status 'ignore))
+                                                 (or (not (string= status "queued"))
+                                                     (null (cdr config))))
+                                        (setcdr config status)
+                                        (force-mode-line-update t)))))
+                 (handle-error (lambda (msg _url-status)
+                                 (message "Failed to update status for %s: %s" root msg))))
+            (funcall make-request project handle-response handle-error))
         (setq build-status--project-status-alist
               (delete config build-status--project-status-alist))))
-
-  (force-mode-line-update t)
   (setq build-status--timer
         (run-at-time build-status-check-interval nil 'build-status--update-status))))
 
@@ -375,9 +398,9 @@ Signals an error if the response does not contain an HTTP 200 status code."
   (interactive)
   (let ((project (build-status--project (buffer-file-name))))
     (when project
-      (browse-url (if (eq 'circle-ci (car project))
-                    (build-status--circle-ci-url project)
-                    (build-status--travis-ci-url project))))))
+      (if (eq 'circle-ci (car project))
+          (browse-url (build-status--circle-ci-url project))
+        (build-status--travis-ci-url project #'browse-url #'message)))))
 
 ;;;###autoload
 (define-minor-mode global-build-status-mode
